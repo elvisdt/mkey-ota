@@ -35,6 +35,14 @@ void advertise() {
   static uint8_t mfg_data[4];
   mfg_data[0] = (uint8_t)(MFG_COMPANY_ID & 0xFF);
   mfg_data[1] = (uint8_t)((MFG_COMPANY_ID >> 8) & 0xFF);
+  // Example bitfield (uncomment and adjust when wiring is final):
+  // mfg_data[2] = 0;
+  // mfg_data[2] |= gpio_get_level(GPIO_NUM_5) ? 0x01 : 0x00; // bit0: door/pin 5
+  // mfg_data[2] |= ota_updating               ? 0x02 : 0x00; // bit1: OTA in progress
+  // mfg_data[2] |= gpio_get_level(GPIO_NUM_1) ? 0x04 : 0x00; // bit2: IGN/pin 1
+  // mfg_data[2] |= gpio_get_level(GPIO_NUM_2) ? 0x08 : 0x00; // bit3: relay/pin 2
+  // mfg_data[2] |= gpio_get_level(GPIO_NUM_6) ? 0x10 : 0x00; // bit4: IN1/pin 6
+  // bits5-7 reserved
   mfg_data[2] = (gpio_get_level(ADV_GPIO_PIN) & 0x1) | (ota_updating ? 0x2 : 0);
   mfg_data[3] = 0x00;
   adv_fields.mfg_data = mfg_data;

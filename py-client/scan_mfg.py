@@ -44,9 +44,13 @@ def decode_mfg_data(manufacturer_data: dict) -> str:
         status = payload[2]
     else:
         status = payload[0] if len(payload) > 0 else 0
-    gpio_level = status & 0x1
-    ota_flag = 1 if (status & 0x2) else 0
-    return f"MFG gpio={gpio_level} ota_updating={ota_flag}"
+    # Bit mapping (see gap.c comments):
+    door = 1 if (status & 0x01) else 0          # bit0: GPIO5 puerta
+    ota_flag = 1 if (status & 0x02) else 0       # bit1: OTA en curso
+    ign = 1 if (status & 0x04) else 0            # bit2: IGN GPIO1
+    relay = 1 if (status & 0x08) else 0          # bit3: relay GPIO2
+    in1 = 1 if (status & 0x10) else 0            # bit4: IN1 GPIO6
+    return f"MFG door={door} ota={ota_flag} ign={ign} relay={relay} in1={in1} raw=0x{status:02x}"
 
 
 async def main():
