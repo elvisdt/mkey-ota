@@ -44,6 +44,8 @@ static const ble_uuid128_t gatt_svr_chr_ota_control_uuid =
     BLE_UUID128_INIT(0xc6, 0x6b, 0x78, 0x03, 0xda, 0xa0, 0xa4, 0xb6, 0x09, 0x51,
                      0x19, 0x84, 0x3d, 0xb4, 0x4b, 0x83);
 
+
+                     
 // characteristic: OTA Data
 // bdda975f-9e48-5c04-b67e-f017f019b150
 static const ble_uuid128_t gatt_svr_chr_ota_data_uuid =

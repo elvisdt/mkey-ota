@@ -4,6 +4,12 @@
 #include "gatt_svr.h"
 #include "nvs_flash.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+
 #define LOG_TAG_MAIN "main"
 
 bool run_diagnostics() {
@@ -57,6 +63,10 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(ret);
 
+  vTaskDelay(pdMS_TO_TICKS(1000));
+  ESP_LOGI(LOG_TAG_MAIN, "Initialization complete.vers_fw=%d", version_fw);
+  vTaskDelay(pdMS_TO_TICKS(2000));
+  
   // BLE Setup
 
   // initialize NimBLE stack (controller and HCI handled inside nimble_port_init)

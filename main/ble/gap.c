@@ -39,12 +39,12 @@ void advertise() {
   // mfg_data[2] = 0;
   // mfg_data[2] |= gpio_get_level(GPIO_NUM_5) ? 0x01 : 0x00; // bit0: door/pin 5
   // mfg_data[2] |= ota_updating               ? 0x02 : 0x00; // bit1: OTA in progress
-  // mfg_data[2] |= gpio_get_level(GPIO_NUM_1) ? 0x04 : 0x00; // bit2: IGN/pin 1
+  mfg_data[2] |= 1 ? 0x04 : 0x00; // bit2: IGN/pin 1
   // mfg_data[2] |= gpio_get_level(GPIO_NUM_2) ? 0x08 : 0x00; // bit3: relay/pin 2
   // mfg_data[2] |= gpio_get_level(GPIO_NUM_6) ? 0x10 : 0x00; // bit4: IN1/pin 6
   // bits5-7 reserved
-  mfg_data[2] = (gpio_get_level(ADV_GPIO_PIN) & 0x1) | (ota_updating ? 0x2 : 0);
-  mfg_data[3] = 0x00;
+  // mfg_data[2] = (gpio_get_level(ADV_GPIO_PIN) & 0x1) | (ota_updating ? 0x2 : 0);
+  mfg_data[3] = version_fw; // version 1
   adv_fields.mfg_data = mfg_data;
   adv_fields.mfg_data_len = sizeof(mfg_data);
 
@@ -154,12 +154,12 @@ static void start_scanning(void) {
   struct ble_gap_disc_params disc_params = {0};
   int rc;
 
-  disc_params.itvl = 0x030;   // 30 ms interval
-  disc_params.window = 0x030; // 30 ms window (100% duty cycle)
+  disc_params.itvl = 0x30;   // 30 ms interval
+  disc_params.window = 0x30; // 30 ms window (100% duty cycle)
   disc_params.filter_policy = BLE_HCI_SCAN_FILT_NO_WL;
   disc_params.limited = 0;
   disc_params.passive = 0;           // active scan to request scan response
-  disc_params.filter_duplicates = 0; // avoid duplicates
+  disc_params.filter_duplicates = 1; // avoid duplicates
 
   rc = ble_gap_disc(addr_type, BLE_HS_FOREVER, &disc_params,
                     gap_event_handler, NULL);

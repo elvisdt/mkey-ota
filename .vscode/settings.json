@@ -1,12 +1,12 @@
 {
   "C_Cpp.intelliSenseEngine": "default",
-  "idf.espIdfPath": "/home/elv/esp/v5.5.1/esp-idf",
-  "idf.pythonInstallPath": "/usr/bin/python3",
+  "idf.espIdfPath": "/home/elvis/esp/v5.5.1/esp-idf",
+  "idf.pythonInstallPath": "/usr/bin/python",
   "idf.openOcdConfigs": [
     "board/esp32c6-lpcore-builtin.cfg"
   ],
   "idf.port": "/dev/ttyACM0",
-  "idf.toolsPath": "/home/elv/.espressif",
+  "idf.toolsPath": "/home/elvis/.espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32c6"
   },
