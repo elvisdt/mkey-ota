@@ -9,6 +9,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
+#include "mkey.h"
 
 #define LOG_TAG_MAIN "main"
 
@@ -63,8 +64,11 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(ret);
 
-  vTaskDelay(pdMS_TO_TICKS(1000));
+  
   ESP_LOGI(LOG_TAG_MAIN, "Initialization complete.vers_fw=%d", version_fw);
+  ESP_LOGI(LOG_TAG_MAIN, "Starting in 2 seconds...");
+  mkey_init_pins();
+
   vTaskDelay(pdMS_TO_TICKS(2000));
   
   // BLE Setup

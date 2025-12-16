@@ -1,4 +1,4 @@
-set(srcs "main.c")
+set(srcs "mkey.c" "main.c")
 
 set(ota_ble_srcs  
     "ble/gap.c"
