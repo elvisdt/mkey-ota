@@ -8,7 +8,7 @@ uint8_t addr_type;
 
 int gap_event_handler(struct ble_gap_event *event, void *arg);
 static void start_scanning(void);
-static void log_ble_addr(const ble_addr_t *addr);
+static void log_ble_addr(const ble_addr_t *addr, int rssi);
 
 #define ADV_GPIO_PIN GPIO_NUM_0
 #define MFG_COMPANY_ID 0x02E5 // Espressif ID
@@ -91,7 +91,7 @@ void sync_cb(void) {
 
 int gap_event_handler(struct ble_gap_event *event, void *arg) {
 
-    ESP_LOGW("GAP","EVENT TYPE 0x%X",event->type);
+    // ESP_LOGW("GAP","EVENT TYPE 0x%X",event->type);
     
     switch (event->type) {
         case BLE_GAP_EVENT_CONNECT:
@@ -119,8 +119,15 @@ int gap_event_handler(struct ble_gap_event *event, void *arg) {
 
         case BLE_GAP_EVENT_DISC:
             // Device discovered while scanning
-            log_ble_addr(&event->disc.addr);
-            ESP_LOGI(LOG_TAG_GAP, "DISC: rssi=%d", event->disc.rssi);
+            
+            if(event->disc.addr.type != BLE_ADDR_PUBLIC) {
+              break;
+            }
+  
+            log_ble_addr(&event->disc.addr, event->disc.rssi);
+            // ESP_LOGI(LOG_TAG_GAP, "DISC: rssi=%d", event->disc.rssi);
+
+            
             break;
 
         case BLE_GAP_EVENT_DISC_COMPLETE:
@@ -170,10 +177,12 @@ static void start_scanning(void) {
   }
 }
 
-static void log_ble_addr(const ble_addr_t *addr) {
+static void log_ble_addr(const ble_addr_t *addr, int rssi) {
   char buf[18];
   snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
            addr->val[5], addr->val[4], addr->val[3],
            addr->val[2], addr->val[1], addr->val[0]);
-  ESP_LOGI(LOG_TAG_GAP, "DISC: addr=%s type=%d", buf, addr->type);
+  ESP_LOGI(LOG_TAG_GAP, "DISC: addr=%s type=%d rssi=%d", buf, addr->type, rssi);
 }
+
+

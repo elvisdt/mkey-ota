@@ -165,7 +165,6 @@ static void update_ota_control(uint16_t conn_handle) {
                                  sizeof(gatt_svr_chr_ota_control_val));
       ble_gattc_notify_custom(conn_handle, ota_control_val_handle, om);
       ESP_LOGI(LOG_TAG_GATT_SVR, "OTA request acknowledgement has been sent.");
-
       break;
 
     case SVR_CHR_OTA_CONTROL_DONE:

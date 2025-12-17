@@ -5,12 +5,16 @@
 
 #include <esp_log.h>
 #include "esp_err.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "mkey.h"
 
 /****************************************************
  * DEFINES
 *****************************************************/
+
 #define LOG_TAG_MKEY "mkey"
 
 
@@ -36,7 +40,7 @@ void mkey_init_pins(void) {
     }
 
 
-        // configure output pins
+    // configure output pins
     gpio_config_t io_conf_out = {
         .intr_type = GPIO_INTR_DISABLE,
         .mode = GPIO_MODE_OUTPUT,
@@ -61,3 +65,32 @@ void mkey_init_pins(void) {
     ESP_LOGI(LOG_TAG_MKEY, "MKEY pins initialized.");
     
 }
+
+
+
+static void task_mkey(void *pvParameters) {
+    while (1) {
+        // read input pins
+        int door_state = gpio_get_level(PIN_IN_DOOR);
+        int ign_state = gpio_get_level(PIN_IN_IGN);
+        int in01_state = gpio_get_level(PIN_IN_01);
+
+        // for testing, log the states
+        ESP_LOGI(LOG_TAG_MKEY, "Door: %d, IGN: %d, IN1: %d",
+                 door_state, ign_state, in01_state);
+
+        vTaskDelay(pdMS_TO_TICKS(1000)); // delay 1 second
+    }
+}   
+
+
+int mkey_start_tasks(void) {
+    BaseType_t ret = xTaskCreate(&task_mkey, "mkey_task", 4096, NULL, 5, NULL);
+    if (ret != pdPASS) {
+        ESP_LOGE(LOG_TAG_MKEY, "Failed to create MKEY task!");
+        return -1;
+    }
+    ESP_LOGI(LOG_TAG_MKEY, "MKEY task started.");
+    return 0;
+}  
+

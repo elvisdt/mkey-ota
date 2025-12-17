@@ -32,3 +32,4 @@ void mkey_init_pins(void);
 
 
 
+int mkey_start_tasks(void);
