@@ -67,7 +67,7 @@ void app_main(void) {
   
   ESP_LOGI(LOG_TAG_MAIN, "Initialization complete.vers_fw=%d", version_fw);
   ESP_LOGI(LOG_TAG_MAIN, "Starting in 2 seconds...");
-  mkey_init_pins();
+  mkey_init();
 
   vTaskDelay(pdMS_TO_TICKS(2000));
   
