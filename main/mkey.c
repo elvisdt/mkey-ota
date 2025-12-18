@@ -289,14 +289,46 @@ static void mkey_configure_wake_source(void) {
     }
 }
 
-static void mkey_setup_wdt(void) {
-    // Mirrors the 10s timer WDT in the Arduino sketch
-    const uint32_t timeout_ms = 10000;
-    esp_err_t ret = esp_task_wdt_init(timeout_ms / 1000, false);
-    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(LOG_TAG_MKEY, "WDT init failed (%s)", esp_err_to_name(ret));
-    }
+// static void mkey_setup_wdt(void) {
+//     // Mirrors the 10s timer WDT in the Arduino sketch
+//     const uint32_t timeout_ms = 10000;
+//     esp_err_t ret = esp_task_wdt_init(timeout_ms / 1000, false);
+//     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+//         ESP_LOGW(LOG_TAG_MKEY, "WDT init failed (%s)", esp_err_to_name(ret));
+//     }
+// }
+
+
+
+// #include "esp_task_wdt.h"
+// #include "esp_log.h"
+
+// static const char *TAG = "MKEY";
+
+static void mkey_setup_wdt(void)
+{
+    // // Timeout en segundos para el TWDT (Arduino usa ~10s por defecto para el loop)
+    // const int timeout_seconds = 10;
+
+    // // panic = false -> no resetea automáticamente, solo loguea (útil para debug)
+    // // panic = true  -> se genera panic/abort y normalmente reset del chip
+    // esp_err_t ret = esp_task_wdt_init(timeout_seconds, /*panic=*/false);
+
+    // // NOTA: esp_task_wdt_init() debe llamarse una sola vez en toda la app.
+    // // Si ya estaba inicializado, devuelve ESP_ERR_INVALID_STATE.
+    // if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+    //     ESP_LOGW(LOG_TAG_MKEY, "Task WDT init falló (%s)", esp_err_to_name(ret));
+    // }
+
+    // // Registrar la tarea actual (por ejemplo, la tarea main/app)
+    // ret = esp_task_wdt_add(NULL);  // NULL = tarea actual
+    // if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+    //     ESP_LOGE(LOG_TAG_MKEY, "No se pudo agregar la tarea al TWDT (%s)", esp_err_to_name(ret));
+    // }
 }
+
+
+
 
 static const char *mkey_reset_reason_str(esp_reset_reason_t reason) {
     switch (reason) {

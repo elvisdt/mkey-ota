@@ -2,3 +2,8 @@ build/
 # sdkconfig
 sdkconfig.old
 .vscode/
+.devcontainer/
+*.log
+*.tmp
+
+# Ignore compiled object files

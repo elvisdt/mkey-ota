@@ -87,8 +87,8 @@ void app_main(void) {
   ble_svc_gap_device_name_set(device_name);
   nimble_port_freertos_init(host_task);
 
-  int err = mkey_start_tasks();
-  if (err != 0) {
-    ESP_LOGE(LOG_TAG_MAIN, "Failed to start MKEY tasks!");
-  }
+  // int err = mkey_start_tasks();
+  // if (err != 0) {
+  //   ESP_LOGE(LOG_TAG_MAIN, "Failed to start MKEY tasks!");
+  // }
 }
