@@ -1,17 +1,160 @@
 #include "gap.h"
 #include "gatt_svr.h"
+#include "mkey.h"
+
 #include "driver/gpio.h"
+#include "host/ble_hs_adv.h"
+#include "nimble/hci_common.h"
+#include "esp_timer.h"
+
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
 
 uint8_t addr_type;
 
 int gap_event_handler(struct ble_gap_event *event, void *arg);
 static void start_scanning(void);
-static void log_ble_addr(const ble_addr_t *addr, int rssi);
+static void stop_scanning(void);
+static const char *adv_type_str(uint8_t event_type);
+static void adv_cache_update(const ble_addr_t *addr, uint8_t mfg_len, int8_t rssi);
+static bool adv_cache_get(const ble_addr_t *addr, uint8_t *mfg_len, int8_t *rssi);
 
 #define ADV_GPIO_PIN    GPIO_NUM_0
 #define MFG_COMPANY_ID  0x02E5
+
+static bool s_gap_ready = false;
+static bool s_scan_requested = false;
+static bool s_scanning = false;
+#if MKEY_BLE_FILTER_MAC
+static bool s_target_mac_parsed = false;
+static bool s_target_mac_valid = false;
+static ble_addr_t s_target_addr = {0};
+#endif
+
+#if MKEY_BLE_FILTER_MAC
+static int hex_value(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return 10 + (c - 'a');
+    }
+    if (c >= 'A' && c <= 'F') {
+        return 10 + (c - 'A');
+    }
+    return -1;
+}
+
+static bool parse_mac_str(const char *str, uint8_t out_le[6]) {
+    if (str == NULL) {
+        return false;
+    }
+
+    uint8_t bytes[6] = {0};
+    const char *p = str;
+    for (int i = 0; i < 6; ++i) {
+        int hi = hex_value(*p++);
+        int lo = hex_value(*p++);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        bytes[i] = (uint8_t)((hi << 4) | lo);
+        if (i < 5) {
+            if (*p != ':') {
+                return false;
+            }
+            ++p;
+        }
+    }
+    if (*p != '\0') {
+        return false;
+    }
+
+    // NimBLE guarda la direccion en orden inverso (LSB primero)
+    for (int i = 0; i < 6; ++i) {
+        out_le[i] = bytes[5 - i];
+    }
+    return true;
+}
+
+static void ensure_target_mac_parsed(void) {
+    if (s_target_mac_parsed) {
+        return;
+    }
+    s_target_mac_parsed = true;
+
+    s_target_addr.type = BLE_ADDR_PUBLIC;
+    s_target_mac_valid = parse_mac_str(MKEY_BLE_TARGET_MAC_STR,
+                                       s_target_addr.val);
+    if (!s_target_mac_valid) {
+        ESP_LOGW(LOG_TAG_GAP, "MAC destino invalida: %s",
+                 MKEY_BLE_TARGET_MAC_STR);
+    }
+}
+#endif
+
+static bool target_mac_matches(const ble_addr_t *addr) {
+#if MKEY_BLE_FILTER_MAC
+    ensure_target_mac_parsed();
+    if (!s_target_mac_valid) {
+        return true; // no bloquear si la MAC es invalida
+    }
+    return memcmp(addr->val, s_target_addr.val, sizeof(addr->val)) == 0;
+#else
+    (void)addr;
+    return true;
+#endif
+}
+
+static bool decode_mkey_payload(const uint8_t *payload, uint8_t len,
+                                mkey_ble_packet_t *out) {
+    if (payload == NULL || out == NULL) {
+        return false;
+    }
+    if (len != MKEY_BLE_EXPECTED_LEN) {
+        return false;
+    }
+
+    uint16_t magic = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+    if (magic != MKEY_BLE_MAGIC) {
+        return false;
+    }
+
+    uint16_t tablet_id =
+        (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+    int battery = payload[4];
+    uint8_t flags = payload[5];
+    int16_t temp_x10 =
+        (int16_t)((uint16_t)payload[6] | ((uint16_t)payload[7] << 8));
+    uint16_t voltage =
+        (uint16_t)payload[8] | ((uint16_t)payload[9] << 8);
+    uint8_t seq = payload[10];
+
+    if (battery < MKEY_BLE_MIN_BATT || battery > MKEY_BLE_MAX_BATT) {
+        return false;
+    }
+    if (temp_x10 < MKEY_BLE_TEMP_MIN_X10 || temp_x10 > MKEY_BLE_TEMP_MAX_X10) {
+        return false;
+    }
+    if (voltage < MKEY_BLE_VOLT_MIN_MV || voltage > MKEY_BLE_VOLT_MAX_MV) {
+        return false;
+    }
+#if MKEY_BLE_TARGET_TABLET_ID
+    if (tablet_id != MKEY_BLE_TARGET_TABLET_ID) {
+        return false;
+    }
+#endif
+
+    out->tablet_id = tablet_id;
+    out->battery_percent = (uint8_t)battery;
+    out->flags = flags;
+    out->temp_x10 = temp_x10;
+    out->voltage_mv = voltage;
+    out->seq = seq;
+    out->rssi = 0;
+    return true;
+}
 
 void advertise() {
 	struct ble_gap_adv_params adv_params;
@@ -83,9 +226,12 @@ void sync_cb(void) {
 	// determine best adress type
 	ble_hs_id_infer_auto(0, &addr_type);
 
-	// start advertising and scanning in parallel
+	// start advertising and wait for scan request
 	advertise();
-	start_scanning();
+	s_gap_ready = true;
+	if (s_scan_requested) {
+		start_scanning();
+	}
 }
 
 int gap_event_handler(struct ble_gap_event *event, void *arg) {
@@ -118,21 +264,114 @@ int gap_event_handler(struct ble_gap_event *event, void *arg) {
 
         case BLE_GAP_EVENT_DISC:
             // Device discovered while scanning
-            
-            if(event->disc.addr.type != BLE_ADDR_PUBLIC) {
-              break;
+            if (!s_scan_requested) {
+                break;
             }
-  
-            log_ble_addr(&event->disc.addr, event->disc.rssi);
-            // ESP_LOGI(LOG_TAG_GAP, "DISC: rssi=%d", event->disc.rssi);
 
-            
+            const bool is_scan_rsp =
+                event->disc.event_type == BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP;
+
+            struct ble_hs_adv_fields fields;
+            int rc = ble_hs_adv_parse_fields(&fields, event->disc.data,
+                                             event->disc.length_data);
+            char name_buf[BLE_HS_ADV_MAX_SZ];
+            const char *name = "<sin_nombre>";
+            uint8_t mfg_len = 0;
+            bool mfg_from_cache = false;
+            if (rc == 0) {
+                if (fields.name != NULL && fields.name_len > 0 &&
+                    fields.name_len < sizeof(name_buf)) {
+                    memcpy(name_buf, fields.name, fields.name_len);
+                    name_buf[fields.name_len] = '\0';
+                    name = name_buf;
+                }
+                if (fields.mfg_data != NULL) {
+                    mfg_len = fields.mfg_data_len;
+                }
+            }
+
+            if (mfg_len == 0) {
+                uint8_t cached_mfg = 0;
+                int8_t cached_rssi = 0;
+                if (adv_cache_get(&event->disc.addr, &cached_mfg, &cached_rssi) &&
+                    cached_mfg > 0) {
+                    mfg_len = cached_mfg;
+                    mfg_from_cache = true;
+                }
+            }
+
+            char addr_buf[18];
+            snprintf(addr_buf, sizeof(addr_buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     event->disc.addr.val[5], event->disc.addr.val[4],
+                     event->disc.addr.val[3], event->disc.addr.val[2],
+                     event->disc.addr.val[1], event->disc.addr.val[0]);
+
+            if (!is_scan_rsp && mfg_len > 0 && !mfg_from_cache) {
+                adv_cache_update(&event->disc.addr, mfg_len, event->disc.rssi);
+            }
+
+            if (MKEY_BLE_LOG_ALL_ADVS) {
+                ESP_LOGI(LOG_TAG_GAP,
+                         "SCAN: addr=%s type=%s name=%s rssi=%d mfg_len=%u%s data_len=%u",
+                         addr_buf, adv_type_str(event->disc.event_type),
+                         name, event->disc.rssi, (unsigned)mfg_len,
+                         mfg_from_cache ? " (cache)" : "",
+                         (unsigned)event->disc.length_data);
+            }
+
+            if (!target_mac_matches(&event->disc.addr)) {
+                break;
+            }
+
+            if (rc != 0) {
+                break;
+            }
+
+            if (is_scan_rsp) {
+                break;
+            }
+
+            if (fields.mfg_data == NULL || fields.mfg_data_len < 2) {
+                break;
+            }
+
+            uint16_t company_id =
+                (uint16_t)fields.mfg_data[0] | ((uint16_t)fields.mfg_data[1] << 8);
+            if (company_id != MKEY_BLE_COMPANY_ID) {
+                break;
+            }
+
+            const uint8_t *payload = fields.mfg_data + 2;
+            uint8_t payload_len = fields.mfg_data_len - 2;
+            mkey_ble_packet_t packet = {0};
+            if (!decode_mkey_payload(payload, payload_len, &packet)) {
+                break;
+            }
+            packet.rssi = event->disc.rssi;
+
+            const uint8_t flags = packet.flags;
+            const unsigned flag_chg = (flags & 0x01) ? 1u : 0u;
+            const unsigned flag_full = (flags & 0x02) ? 1u : 0u;
+            const unsigned flag_plug = (flags & 0x04) ? 1u : 0u;
+            ESP_LOGI(LOG_TAG_GAP,
+                     "MKEY: mac=%s id=%u batt=%u%% seq=%u rssi=%d temp_x10=%d volt=%u flags=0x%02X (C=%u F=%u P=%u)",
+                     addr_buf, packet.tablet_id, packet.battery_percent,
+                     packet.seq, packet.rssi, (int)packet.temp_x10,
+                     (unsigned)packet.voltage_mv, (unsigned)flags,
+                     flag_chg, flag_full, flag_plug);
+
+            mkey_notify_ble_packet(&packet);
+
+            // log_ble_addr(&event->disc.addr, event->disc.rssi);
             break;
 
         case BLE_GAP_EVENT_DISC_COMPLETE:
             // Restart scanning if it stops
-            ESP_LOGI(LOG_TAG_GAP, "DISC complete, restarting scan");
-            start_scanning();
+            s_scanning = false;
+            if (s_scan_requested) {
+                ESP_LOGI(LOG_TAG_GAP, "DISC complete, restarting scan");
+                start_scanning();
+            }
             break;
 
         case BLE_GAP_EVENT_SUBSCRIBE:
@@ -155,6 +394,10 @@ void host_task(void *param) {
 }
 
 static void start_scanning(void) {
+	if (s_scanning) {
+		return;
+	}
+
 	struct ble_gap_disc_params disc_params = {0};
 	int rc;
 
@@ -169,17 +412,128 @@ static void start_scanning(void) {
 	if (rc != 0) {
 		ESP_LOGE(LOG_TAG_GAP, "Error starting scan: rc=%d", rc);
 	} else {
+		s_scanning = true;
 		ESP_LOGI(LOG_TAG_GAP, "Scanning started");
 	}
 }
 
-static void log_ble_addr(const ble_addr_t *addr,int rssi){
-	char buf[18];
-	snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
-	addr->val[5], addr->val[4], addr->val[3],
-	addr->val[2], addr->val[1], addr->val[0]);
-  
-	ESP_LOGI(LOG_TAG_GAP, "DISC: addr=%s type=%d -> RSSI: %d", buf, addr->type, rssi);
+static void stop_scanning(void) {
+	if (!s_scanning) {
+		return;
+	}
+
+	int rc = ble_gap_disc_cancel();
+	if (rc != 0) {
+		ESP_LOGW(LOG_TAG_GAP, "Error stopping scan: rc=%d", rc);
+	} else {
+		s_scanning = false;
+		ESP_LOGI(LOG_TAG_GAP, "Scanning stopped");
+	}
+}
+
+void gap_scan_request(bool enable) {
+	s_scan_requested = enable;
+	if (!s_gap_ready) {
+		return;
+	}
+	if (enable) {
+#if MKEY_BLE_FILTER_MAC
+		ensure_target_mac_parsed();
+#endif
+		start_scanning();
+	} else {
+		stop_scanning();
+	}
 }
 
 
+#define MKEY_ADV_CACHE_SIZE 12
+
+typedef struct {
+    ble_addr_t addr;
+    uint8_t mfg_len;
+    int8_t rssi;
+    int64_t last_seen_us;
+    bool valid;
+} mkey_adv_cache_t;
+
+static mkey_adv_cache_t s_adv_cache[MKEY_ADV_CACHE_SIZE];
+
+static const char *adv_type_str(uint8_t event_type) {
+    switch (event_type) {
+        case BLE_HCI_ADV_RPT_EVTYPE_ADV_IND:
+            return "ADV";
+        case BLE_HCI_ADV_RPT_EVTYPE_DIR_IND:
+            return "DIR";
+        case BLE_HCI_ADV_RPT_EVTYPE_SCAN_IND:
+            return "SCAN";
+        case BLE_HCI_ADV_RPT_EVTYPE_NONCONN_IND:
+            return "NONCONN";
+        case BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP:
+            return "RSP";
+        default:
+            return "UNK";
+    }
+}
+
+static bool addr_equals(const ble_addr_t *a, const ble_addr_t *b) {
+    return a->type == b->type &&
+           memcmp(a->val, b->val, sizeof(a->val)) == 0;
+}
+
+static void adv_cache_update(const ble_addr_t *addr, uint8_t mfg_len, int8_t rssi) {
+    if (addr == NULL) {
+        return;
+    }
+
+    int idx_free = -1;
+    int idx_oldest = 0;
+    int64_t oldest_us = INT64_MAX;
+    const int64_t now_us = esp_timer_get_time();
+
+    for (int i = 0; i < MKEY_ADV_CACHE_SIZE; ++i) {
+        if (s_adv_cache[i].valid) {
+            if (addr_equals(&s_adv_cache[i].addr, addr)) {
+                s_adv_cache[i].mfg_len = mfg_len;
+                s_adv_cache[i].rssi = rssi;
+                s_adv_cache[i].last_seen_us = now_us;
+                return;
+            }
+            if (s_adv_cache[i].last_seen_us < oldest_us) {
+                oldest_us = s_adv_cache[i].last_seen_us;
+                idx_oldest = i;
+            }
+        } else if (idx_free < 0) {
+            idx_free = i;
+        }
+    }
+
+    int idx = (idx_free >= 0) ? idx_free : idx_oldest;
+    s_adv_cache[idx].addr = *addr;
+    s_adv_cache[idx].mfg_len = mfg_len;
+    s_adv_cache[idx].rssi = rssi;
+    s_adv_cache[idx].last_seen_us = now_us;
+    s_adv_cache[idx].valid = true;
+}
+
+static bool adv_cache_get(const ble_addr_t *addr, uint8_t *mfg_len, int8_t *rssi) {
+    if (addr == NULL) {
+        return false;
+    }
+
+    for (int i = 0; i < MKEY_ADV_CACHE_SIZE; ++i) {
+        if (!s_adv_cache[i].valid) {
+            continue;
+        }
+        if (addr_equals(&s_adv_cache[i].addr, addr)) {
+            if (mfg_len) {
+                *mfg_len = s_adv_cache[i].mfg_len;
+            }
+            if (rssi) {
+                *rssi = s_adv_cache[i].rssi;
+            }
+            return true;
+        }
+    }
+    return false;
+}

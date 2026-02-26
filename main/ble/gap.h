@@ -15,3 +15,4 @@ void advertise();
 void reset_cb(int reason);
 void sync_cb(void);
 void host_task(void *param);
+void gap_scan_request(bool enable);

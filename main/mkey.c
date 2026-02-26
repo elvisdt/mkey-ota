@@ -1,4 +1,3 @@
-
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -6,7 +5,6 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
@@ -15,6 +13,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
+#include "gap.h"
 #include "mkey.h"
 
 /****************************************************
@@ -25,44 +24,41 @@
 
 #define MKEY_CTRL_TASK_STACK   4096
 #define MKEY_CTRL_TASK_PRIO    5
-#define MKEY_CTRL_TICK_MS      10
-#define MKEY_SCAN_TICK_MS      1000
+#define MKEY_CTRL_TICK_MS      100
 
 /****************************************************
  * TYPES
 *****************************************************/
 typedef enum {
-    MKEY_EVT_BEACON = 0,
-    MKEY_EVT_SCAN_TICK,
+    MKEY_EVT_BLE_PACKET = 0,
 } mkey_evt_type_t;
 
 typedef struct {
     mkey_evt_type_t type;
-    mkey_beacon_event_t beacon;
+    mkey_ble_packet_t packet;
 } mkey_evt_t;
+
+typedef enum {
+    MKEY_CHG_IDLE = 0,
+    MKEY_CHG_CHARGING,
+} mkey_charge_state_t;
 
 typedef struct {
     bool started;
-    bool beacon_authorized;
-    bool door_latched; // mirrors flanco_door (1 until door opens)
-    int rssi_threshold_dev1;
-    int rssi_threshold_dev2;
-    uint32_t scan_cycles;
-    int64_t last_beacon_us;
-    int64_t ign_off_start_us;
+    bool ign_on;
+    mkey_charge_state_t charge_state;
+    uint8_t last_battery;
+    int64_t last_packet_us;
     QueueHandle_t queue;
     TaskHandle_t task;
 } mkey_ctx_t;
 
 static mkey_ctx_t s_ctx = {
     .started = false,
-    .beacon_authorized = false,
-    .door_latched = true,
-    .rssi_threshold_dev1 = MKEY_RSSI_MIN_DEVICE1,
-    .rssi_threshold_dev2 = MKEY_RSSI_MIN_DEVICE2,
-    .scan_cycles = 0,
-    .last_beacon_us = 0,
-    .ign_off_start_us = 0,
+    .ign_on = false,
+    .charge_state = MKEY_CHG_IDLE,
+    .last_battery = 0,
+    .last_packet_us = 0,
     .queue = NULL,
     .task = NULL,
 };
@@ -71,12 +67,9 @@ static mkey_ctx_t s_ctx = {
  * FORWARD DECLARATIONS
 *****************************************************/
 static void mkey_control_task(void *arg);
-static void mkey_process_beacon(const mkey_beacon_event_t *event);
-static void mkey_process_inputs(int64_t now_us);
-static void mkey_prepare_sleep(const char *reason);
-static void mkey_beep(uint32_t duration_ms);
-static void mkey_configure_wake_source(void);
-static void mkey_setup_wdt(void);
+static void mkey_update_charge_state(uint8_t battery_percent);
+static void mkey_set_charging(bool enable);
+static bool mkey_is_ign_on(void);
 static const char *mkey_reset_reason_str(esp_reset_reason_t reason);
 
 /****************************************************
@@ -92,9 +85,6 @@ void mkey_init(void) {
 
     ESP_LOGI(LOG_TAG_MKEY, "Reset reason: %s",
              mkey_reset_reason_str(esp_reset_reason()));
-
-    mkey_configure_wake_source();
-    mkey_setup_wdt();
 
     s_ctx.queue = xQueueCreate(8, sizeof(mkey_evt_t));
     if (s_ctx.queue == NULL) {
@@ -115,26 +105,14 @@ void mkey_init(void) {
     s_ctx.started = true;
 }
 
-void mkey_notify_beacon(const mkey_beacon_event_t *event) {
-    if (!s_ctx.queue || event == NULL) {
+void mkey_notify_ble_packet(const mkey_ble_packet_t *packet) {
+    if (!s_ctx.queue || packet == NULL) {
         return;
     }
 
     mkey_evt_t msg = {
-        .type = MKEY_EVT_BEACON,
-        .beacon = *event,
-    };
-
-    xQueueSend(s_ctx.queue, &msg, 0);
-}
-
-void mkey_notify_scan_cycle(void) {
-    if (!s_ctx.queue) {
-        return;
-    }
-
-    mkey_evt_t msg = {
-        .type = MKEY_EVT_SCAN_TICK,
+        .type = MKEY_EVT_BLE_PACKET,
+        .packet = *packet,
     };
 
     xQueueSend(s_ctx.queue, &msg, 0);
@@ -150,47 +128,51 @@ static void mkey_control_task(void *arg) {
                  esp_err_to_name(wdt_ret));
     }
 
-    int64_t last_scan_tick_us = esp_timer_get_time();
+    s_ctx.ign_on = mkey_is_ign_on();
+    gap_scan_request(s_ctx.ign_on);
+    if (!s_ctx.ign_on) {
+        mkey_set_charging(false);
+        s_ctx.charge_state = MKEY_CHG_IDLE;
+        s_ctx.last_packet_us = 0;
+    }
 
     while (1) {
         mkey_evt_t evt;
         while (xQueueReceive(s_ctx.queue, &evt, 0) == pdTRUE) {
-            switch (evt.type) {
-                case MKEY_EVT_BEACON:
-                    mkey_process_beacon(&evt.beacon);
-                    break;
-                case MKEY_EVT_SCAN_TICK:
-                    s_ctx.scan_cycles++;
-                    break;
+            if (evt.type == MKEY_EVT_BLE_PACKET) {
+                if (!s_ctx.ign_on) {
+                    continue;
+                }
+                s_ctx.last_battery = evt.packet.battery_percent;
+                s_ctx.last_packet_us = esp_timer_get_time();
+                mkey_update_charge_state(evt.packet.battery_percent);
             }
         }
 
-        const int64_t now_us = esp_timer_get_time();
+        const bool ign_now = mkey_is_ign_on();
+        if (ign_now != s_ctx.ign_on) {
+            s_ctx.ign_on = ign_now;
+            gap_scan_request(s_ctx.ign_on);
 
-        // Synthetic scan tick every second to mimic SCAN_BLE() loops
-        if ((now_us - last_scan_tick_us) >= (int64_t)MKEY_SCAN_TICK_MS * 1000) {
-            s_ctx.scan_cycles++;
-            last_scan_tick_us = now_us;
+            if (!s_ctx.ign_on) {
+                mkey_set_charging(false);
+                s_ctx.charge_state = MKEY_CHG_IDLE;
+                s_ctx.last_packet_us = 0;
+            }
         }
 
-        // Drop authorization if we stop hearing the beacon
-        if (s_ctx.beacon_authorized && s_ctx.last_beacon_us > 0 &&
-            (now_us - s_ctx.last_beacon_us) >
-                (int64_t)MKEY_BEACON_STALE_MS * 1000) {
-            ESP_LOGW(LOG_TAG_MKEY, "Beacon stale, relocking outputs");
-            s_ctx.beacon_authorized = false;
-            s_ctx.ign_off_start_us = 0;
-            s_ctx.door_latched = true;
-            gpio_set_level(PIN_OUT_RELAY, 1);
-            gpio_set_level(PIN_OUT_LED, 0);
-        }
-
-        // When a beacon is around, mirror the ignition/door logic.
-        if (s_ctx.beacon_authorized) {
-            s_ctx.scan_cycles = 0; // hold off the low power timer
-            mkey_process_inputs(now_us);
-        } else if (s_ctx.scan_cycles >= MKEY_SCAN_LIMIT_CYCLES) {
-            mkey_prepare_sleep("scan timeout (no beacon detected)");
+        if (s_ctx.ign_on && MKEY_BLE_STALE_TIMEOUT_MS > 0 &&
+            s_ctx.last_packet_us > 0) {
+            const int64_t now_us = esp_timer_get_time();
+            const int64_t age_ms = (now_us - s_ctx.last_packet_us) / 1000;
+            if (age_ms >= (int64_t)MKEY_BLE_STALE_TIMEOUT_MS) {
+                if (s_ctx.charge_state != MKEY_CHG_IDLE) {
+                    ESP_LOGW(LOG_TAG_MKEY, "BLE stale (%lld ms), stopping charge",
+                             (long long)age_ms);
+                    s_ctx.charge_state = MKEY_CHG_IDLE;
+                    mkey_set_charging(false);
+                }
+            }
         }
 
         esp_task_wdt_reset();
@@ -198,137 +180,48 @@ static void mkey_control_task(void *arg) {
     }
 }
 
-static void mkey_process_beacon(const mkey_beacon_event_t *event) {
-    const int threshold = (event->id == MKEY_BEACON_DEVICE1)
-                              ? s_ctx.rssi_threshold_dev1
-                              : s_ctx.rssi_threshold_dev2;
-
-    if (!event->metadata_ok) {
-        ESP_LOGI(LOG_TAG_MKEY,
-                 "Beacon %d ignored (metadata missing/invalid)", event->id);
+static void mkey_update_charge_state(uint8_t battery_percent) {
+    if (battery_percent > MKEY_BLE_MAX_BATT) {
         return;
     }
 
-    if (event->rssi < threshold) {
-        ESP_LOGI(LOG_TAG_MKEY, "Beacon %d ignored (rssi=%d < %d)", event->id,
-                 event->rssi, threshold);
+    if (s_ctx.charge_state == MKEY_CHG_IDLE) {
+        if (battery_percent <= MKEY_CHARGE_START_PCT) {
+            s_ctx.charge_state = MKEY_CHG_CHARGING;
+            ESP_LOGI(LOG_TAG_MKEY, "Battery %u%% -> charging ON",
+                     battery_percent);
+            mkey_set_charging(true);
+        }
         return;
     }
 
-    s_ctx.beacon_authorized = true;
-    s_ctx.scan_cycles = 0;
-    s_ctx.door_latched = true; // wait for the first door open event
-    s_ctx.ign_off_start_us = 0;
-    s_ctx.last_beacon_us = esp_timer_get_time();
-
-    gpio_set_level(PIN_OUT_RELAY, 0); // unlock pulse
-    gpio_set_level(PIN_OUT_LED, 1);
-    mkey_beep(MKEY_BUZZER_PULSE_MS);
-
-    ESP_LOGI(LOG_TAG_MKEY, "Beacon %d accepted (rssi=%d, metadata ok)",
-             event->id, event->rssi);
-}
-
-static void mkey_process_inputs(int64_t now_us) {
-    const bool ign_off = gpio_get_level(PIN_IN_IGN);
-    const bool door_open = gpio_get_level(PIN_IN_DOOR) == 0;
-
-    if (ign_off) {
-        if (s_ctx.ign_off_start_us == 0) {
-            s_ctx.ign_off_start_us = now_us;
+    if (s_ctx.charge_state == MKEY_CHG_CHARGING) {
+        if (battery_percent >= MKEY_CHARGE_STOP_PCT) {
+            s_ctx.charge_state = MKEY_CHG_IDLE;
+            ESP_LOGI(LOG_TAG_MKEY, "Battery %u%% -> charging OFF",
+                     battery_percent);
+            mkey_set_charging(false);
         }
-
-        if (door_open) {
-            s_ctx.door_latched = false; // flanco_door = 0
-            s_ctx.ign_off_start_us = now_us; // restart the 30s window
-        }
-
-        gpio_set_level(PIN_OUT_RELAY, 1);
-        gpio_set_level(PIN_OUT_LED, 1);
-
-        const int64_t elapsed = now_us - s_ctx.ign_off_start_us;
-        if (!s_ctx.door_latched &&
-            elapsed >= (int64_t)MKEY_IGN_DOOR_SLEEP_MS * 1000) {
-            mkey_prepare_sleep("IGN off with door open timeout");
-        } else if (elapsed >= (int64_t)MKEY_IGN_MAX_SLEEP_MS * 1000) {
-            mkey_prepare_sleep("IGN off hard timeout");
-        }
-    } else {
-        // IGN on: stay awake and unlocked
-        s_ctx.door_latched = true;
-        s_ctx.ign_off_start_us = 0;
-        gpio_set_level(PIN_OUT_RELAY, 0);
-        gpio_set_level(PIN_OUT_LED, 0);
     }
 }
 
-static void mkey_prepare_sleep(const char *reason) {
-    ESP_LOGI(LOG_TAG_MKEY, "Entering deep sleep: %s", reason);
+static void mkey_set_charging(bool enable) {
+    const int relay_level =
+        enable ? MKEY_RELAY_ACTIVE_LEVEL : !MKEY_RELAY_ACTIVE_LEVEL;
+    const int led_level =
+        enable ? MKEY_LED_ACTIVE_LEVEL : !MKEY_LED_ACTIVE_LEVEL;
 
-    // Safe output levels before sleep
-    gpio_set_level(PIN_OUT_BUZZER, 0);
-    gpio_set_level(PIN_OUT_LED, 0);
-    gpio_set_level(PIN_OUT_RELAY, 1);
-
-    esp_deep_sleep_start(); // does not return
+    gpio_set_level(PIN_OUT_RELAY, relay_level);
+    gpio_set_level(PIN_OUT_LED, led_level);
 }
 
-static void mkey_beep(uint32_t duration_ms) {
-    gpio_set_level(PIN_OUT_BUZZER, 1);
-    vTaskDelay(pdMS_TO_TICKS(duration_ms));
-    gpio_set_level(PIN_OUT_BUZZER, 0);
+static bool mkey_is_ign_on(void) {
+#if MKEY_SIMULATE_IGN
+    return true;
+#else
+    return gpio_get_level(PIN_IN_IGN) == MKEY_IGN_ACTIVE_LEVEL;
+#endif
 }
-
-static void mkey_configure_wake_source(void) {
-    const uint64_t wake_mask = (1ULL << PIN_IN_DOOR);
-    esp_err_t ret =
-        esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ALL_LOW);
-    if (ret != ESP_OK) {
-        ESP_LOGW(LOG_TAG_MKEY, "Failed to set wake source (%s)",
-                 esp_err_to_name(ret));
-    }
-}
-
-// static void mkey_setup_wdt(void) {
-//     // Mirrors the 10s timer WDT in the Arduino sketch
-//     const uint32_t timeout_ms = 10000;
-//     esp_err_t ret = esp_task_wdt_init(timeout_ms / 1000, false);
-//     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-//         ESP_LOGW(LOG_TAG_MKEY, "WDT init failed (%s)", esp_err_to_name(ret));
-//     }
-// }
-
-
-
-// #include "esp_task_wdt.h"
-// #include "esp_log.h"
-
-// static const char *TAG = "MKEY";
-
-static void mkey_setup_wdt(void)
-{
-    // // Timeout en segundos para el TWDT (Arduino usa ~10s por defecto para el loop)
-    // const int timeout_seconds = 10;
-
-    // // panic = false -> no resetea automáticamente, solo loguea (útil para debug)
-    // // panic = true  -> se genera panic/abort y normalmente reset del chip
-    // esp_err_t ret = esp_task_wdt_init(timeout_seconds, /*panic=*/false);
-
-    // // NOTA: esp_task_wdt_init() debe llamarse una sola vez en toda la app.
-    // // Si ya estaba inicializado, devuelve ESP_ERR_INVALID_STATE.
-    // if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-    //     ESP_LOGW(LOG_TAG_MKEY, "Task WDT init falló (%s)", esp_err_to_name(ret));
-    // }
-
-    // // Registrar la tarea actual (por ejemplo, la tarea main/app)
-    // ret = esp_task_wdt_add(NULL);  // NULL = tarea actual
-    // if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-    //     ESP_LOGE(LOG_TAG_MKEY, "No se pudo agregar la tarea al TWDT (%s)", esp_err_to_name(ret));
-    // }
-}
-
-
-
 
 static const char *mkey_reset_reason_str(esp_reset_reason_t reason) {
     switch (reason) {
@@ -352,36 +245,32 @@ static const char *mkey_reset_reason_str(esp_reset_reason_t reason) {
 }
 
 /****************************************************
- * HARDWARE SETUP (unchanged)
+ * HARDWARE SETUP
 *****************************************************/
 void mkey_init_pins(void) {
-
     esp_err_t ret = ESP_OK;
 
     ESP_LOGI(LOG_TAG_MKEY, "Initializing MKEY pins...");
 
-    // configure input pins
+#if !MKEY_SIMULATE_IGN
     gpio_config_t io_conf_in = {
         .intr_type = GPIO_INTR_DISABLE,
         .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask =
-            (1ULL << PIN_IN_DOOR) | (1ULL << PIN_IN_01) | (1ULL << PIN_IN_IGN),
+        .pin_bit_mask = (1ULL << PIN_IN_IGN),
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pull_up_en = GPIO_PULLUP_ENABLE,
     };
     ret = gpio_config(&io_conf_in);
     if (ret != ESP_OK) {
-        ESP_LOGE(LOG_TAG_MKEY, "Failed to configure input pins (%s)!",
+        ESP_LOGE(LOG_TAG_MKEY, "Failed to configure input pin (%s)!",
                  esp_err_to_name(ret));
     }
+#endif
 
-    // configure output pins
     gpio_config_t io_conf_out = {
         .intr_type = GPIO_INTR_DISABLE,
         .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL << PIN_OUT_BUZZER) | (1ULL << PIN_OUT_RELAY) |
-                        (1ULL << PIN_OUT_01) | (1ULL << PIN_OUT_02) |
-                        (1ULL << PIN_OUT_LED),
+        .pin_bit_mask = (1ULL << PIN_OUT_RELAY) | (1ULL << PIN_OUT_LED),
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pull_up_en = GPIO_PULLUP_DISABLE,
     };
@@ -391,39 +280,7 @@ void mkey_init_pins(void) {
                  esp_err_to_name(ret));
     }
 
-    gpio_set_level(PIN_OUT_BUZZER, 0);
-    gpio_set_level(PIN_OUT_RELAY, 1);
-    gpio_set_level(PIN_OUT_01, 0);
-    gpio_set_level(PIN_OUT_02, 0);
-    gpio_set_level(PIN_OUT_LED, 0);
+    mkey_set_charging(false);
 
     ESP_LOGI(LOG_TAG_MKEY, "MKEY pins initialized.");
 }
-
-
-
-static void task_mkey(void *pvParameters) {
-    while (1) {
-        // read input pins
-        int door_state = gpio_get_level(PIN_IN_DOOR);
-        int ign_state = gpio_get_level(PIN_IN_IGN);
-        int in01_state = gpio_get_level(PIN_IN_01);
-
-        // for testing, log the states
-        ESP_LOGI(LOG_TAG_MKEY, "Door: %d, IGN: %d, IN1: %d",
-                 door_state, ign_state, in01_state);
-
-        vTaskDelay(pdMS_TO_TICKS(1000)); // delay 1 second
-    }
-}   
-
-
-int mkey_start_tasks(void) {
-    BaseType_t ret = xTaskCreate(&task_mkey, "mkey_task", 4096, NULL, 5, NULL);
-    if (ret != pdPASS) {
-        ESP_LOGE(LOG_TAG_MKEY, "Failed to create MKEY task!");
-        return -1;
-    }
-    ESP_LOGI(LOG_TAG_MKEY, "MKEY task started.");
-    return 0;
-}  

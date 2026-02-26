@@ -1,85 +1,83 @@
-
 #pragma once
 
 #include <stdint.h>
 #include <stdbool.h>
+
 #include "driver/gpio.h"
 
 // ----------------------------------------------------
-// MKEY BEACON / TIMING CONSTANTS (ported from mkey.ino)
+// MKEY HARDWARE DEFINES (ajusta segun la tarjeta)
 // ----------------------------------------------------
 
-// Maximum number of scan loops before forcing low power (approx 250 seconds).
-#define MKEY_SCAN_LIMIT_CYCLES        250
+#define PIN_OUT_RELAY   2
+#define PIN_OUT_LED     7
 
-// Time with IGN off and door open before sleeping (ms) - ~30s in the .ino.
-#define MKEY_IGN_DOOR_SLEEP_MS        (30 * 1000)
+#define PIN_IN_IGN      1
 
-// Hard timeout with IGN off while a key is present (ms) - ~10 min in the .ino.
-#define MKEY_IGN_MAX_SLEEP_MS         (10 * 60 * 1000)
+// Niveles activos (1 = nivel alto, 0 = nivel bajo)
+// En el firmware anterior IGN parecia activo en bajo; ajusta si aplica.
+#define MKEY_IGN_ACTIVE_LEVEL     0
 
-// Drop presence if no beacon refresh is received within this window (ms).
-#define MKEY_BEACON_STALE_MS          5000
-
-// Duration of the audible pulse when a valid beacon is seen (ms).
-#define MKEY_BUZZER_PULSE_MS          50
-
-// RSSI thresholds used to accept a beacon as "nearby".
-#define MKEY_RSSI_MIN_DEVICE1         (-120)
-#define MKEY_RSSI_MIN_DEVICE2         (-120)
+// Simulacion de IGN (1 = IGN siempre activo, 0 = leer pin real)
+#define MKEY_SIMULATE_IGN         1
+#define MKEY_RELAY_ACTIVE_LEVEL   0
+#define MKEY_LED_ACTIVE_LEVEL     1
 
 // ----------------------------------------------------
-// MKEY HARDWARE DEFINES
+// CARGA DE BATERIA
 // ----------------------------------------------------
 
-#define MKEY_DEV_NAME        "MKEY_BT"
-#define MKEY_DEV_NAME_LEN    (sizeof(MKEY_DEV_NAME) - 1)
+#define MKEY_CHARGE_START_PCT     20
+#define MKEY_CHARGE_STOP_PCT      80
 
-
-#define MKEY_BLE_ADV_INTERVAL_MIN    0x20  // 20ms
-#define MKEY_BLE_ADV_INTERVAL_MAX    0x40  // 40ms
-
-
-#define PIN_OUT_BUZZER    0
-#define PIN_OUT_RELAY     2
-#define PIN_OUT_01        3
-#define PIN_OUT_02        4
-#define PIN_OUT_LED       7
-
-#define PIN_IN_DOOR      5
-#define PIN_IN_01        6
-#define PIN_IN_IGN       1
+// Si no hay datos BLE nuevos por este tiempo, puedes decidir desactivar carga.
+// 0 = deshabilitado.
+#define MKEY_BLE_STALE_TIMEOUT_MS 0
 
 // ----------------------------------------------------
-// MKEY BLE FACING API
+// BLE (manufacturer data) - basado en py-client/scan_decode.py
 // ----------------------------------------------------
 
-typedef enum {
-    MKEY_BEACON_DEVICE1 = 0,
-    MKEY_BEACON_DEVICE2,
-} mkey_beacon_id_t;
+#define MKEY_BLE_COMPANY_ID       0xFFFF
+#define MKEY_BLE_MAGIC            0xAABB
+#define MKEY_BLE_EXPECTED_LEN     11
+
+// Filtrar por MAC del emisor (formato "AA:BB:CC:DD:EE:FF")
+#define MKEY_BLE_FILTER_MAC       0
+#define MKEY_BLE_TARGET_MAC_STR   "DC:1E:D5:6A:A0:EE"
+
+// Filtrar por tablet_id (0 = deshabilitado)
+#define MKEY_BLE_TARGET_TABLET_ID 0
+
+// Logging (1 = log all advertisements, 0 = only log valid MKEY packets)
+#define MKEY_BLE_LOG_ALL_ADVS    0
+
+// Validaciones basicas (igual al script Python)
+#define MKEY_BLE_MIN_BATT         0
+#define MKEY_BLE_MAX_BATT         100
+#define MKEY_BLE_TEMP_MIN_X10     (-200)  // -20.0 C
+#define MKEY_BLE_TEMP_MAX_X10     (800)   // 80.0 C
+#define MKEY_BLE_VOLT_MIN_MV      2500
+#define MKEY_BLE_VOLT_MAX_MV      5000
+
+// ----------------------------------------------------
+// MKEY BLE PACKET
+// ----------------------------------------------------
 
 typedef struct {
-    mkey_beacon_id_t id;   // Which key/tag was seen
-    int rssi;              // RSSI reported by the scan
-    bool metadata_ok;      // True when manufacturer payload matched (&H123$ in the .ino)
-} mkey_beacon_event_t;
+    uint16_t tablet_id;
+    uint8_t battery_percent;
+    uint8_t flags;
+    int16_t temp_x10;
+    uint16_t voltage_mv;
+    uint8_t seq;
+    int rssi;
+} mkey_ble_packet_t;
 
-// Initializes pins, wake sources and starts the control loop that mirrors
-// the legacy mkey.ino flow (minus BLE scanning, which should call
-// mkey_notify_beacon).
+// ----------------------------------------------------
+// API
+// ----------------------------------------------------
+
 void mkey_init(void);
-
-// Notify the control loop that a beacon was observed. Call this from BLE
-// callbacks once RSSI and payload have been validated.
-void mkey_notify_beacon(const mkey_beacon_event_t *event);
-
-// Inform the control loop that a scan cycle finished. If unused, the loop
-// will increment its own scan counter on time.
-void mkey_notify_scan_cycle(void);
-
 void mkey_init_pins(void);
-
-
-
-int mkey_start_tasks(void);
+void mkey_notify_ble_packet(const mkey_ble_packet_t *packet);
