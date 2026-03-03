@@ -17,9 +17,8 @@ Este proyecto ahora funciona como **controlador de carga** basado en BLE.
 Revisa y ajusta en `main/mkey.h`:
 - Pines (`PIN_IN_IGN`, `PIN_OUT_RELAY`, `PIN_OUT_LED`)
 - Niveles activos (`MKEY_*_ACTIVE_LEVEL`)
-- Simulación de IGN (`MKEY_SIMULATE_IGN`)
 - Umbrales de carga (`MKEY_CHARGE_START_PCT`, `MKEY_CHARGE_STOP_PCT`)
-- BLE Company ID y MAC (`MKEY_BLE_COMPANY_ID`, `MKEY_BLE_TARGET_MAC_STR`)
+- BLE Company ID y MAC (`MKEY_BLE_COMPANY_ID`)
 
 ## OTA BLE
 La parte OTA BLE (GATT) sigue en `main/ble/` y no se ha tocado.

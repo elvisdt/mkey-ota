@@ -26,86 +26,10 @@ static bool adv_cache_get(const ble_addr_t *addr, uint8_t *mfg_len, int8_t *rssi
 static bool s_gap_ready = false;
 static bool s_scan_requested = false;
 static bool s_scanning = false;
-#if MKEY_BLE_FILTER_MAC
-static bool s_target_mac_parsed = false;
-static bool s_target_mac_valid = false;
-static ble_addr_t s_target_addr = {0};
-#endif
 
-#if MKEY_BLE_FILTER_MAC
-static int hex_value(char c) {
-    if (c >= '0' && c <= '9') {
-        return c - '0';
-    }
-    if (c >= 'a' && c <= 'f') {
-        return 10 + (c - 'a');
-    }
-    if (c >= 'A' && c <= 'F') {
-        return 10 + (c - 'A');
-    }
-    return -1;
-}
 
-static bool parse_mac_str(const char *str, uint8_t out_le[6]) {
-    if (str == NULL) {
-        return false;
-    }
 
-    uint8_t bytes[6] = {0};
-    const char *p = str;
-    for (int i = 0; i < 6; ++i) {
-        int hi = hex_value(*p++);
-        int lo = hex_value(*p++);
-        if (hi < 0 || lo < 0) {
-            return false;
-        }
-        bytes[i] = (uint8_t)((hi << 4) | lo);
-        if (i < 5) {
-            if (*p != ':') {
-                return false;
-            }
-            ++p;
-        }
-    }
-    if (*p != '\0') {
-        return false;
-    }
 
-    // NimBLE guarda la direccion en orden inverso (LSB primero)
-    for (int i = 0; i < 6; ++i) {
-        out_le[i] = bytes[5 - i];
-    }
-    return true;
-}
-
-static void ensure_target_mac_parsed(void) {
-    if (s_target_mac_parsed) {
-        return;
-    }
-    s_target_mac_parsed = true;
-
-    s_target_addr.type = BLE_ADDR_PUBLIC;
-    s_target_mac_valid = parse_mac_str(MKEY_BLE_TARGET_MAC_STR,
-                                       s_target_addr.val);
-    if (!s_target_mac_valid) {
-        ESP_LOGW(LOG_TAG_GAP, "MAC destino invalida: %s",
-                 MKEY_BLE_TARGET_MAC_STR);
-    }
-}
-#endif
-
-static bool target_mac_matches(const ble_addr_t *addr) {
-#if MKEY_BLE_FILTER_MAC
-    ensure_target_mac_parsed();
-    if (!s_target_mac_valid) {
-        return true; // no bloquear si la MAC es invalida
-    }
-    return memcmp(addr->val, s_target_addr.val, sizeof(addr->val)) == 0;
-#else
-    (void)addr;
-    return true;
-#endif
-}
 
 static bool decode_mkey_payload(const uint8_t *payload, uint8_t len,
                                 mkey_ble_packet_t *out) {
@@ -319,9 +243,6 @@ int gap_event_handler(struct ble_gap_event *event, void *arg) {
                          (unsigned)event->disc.length_data);
             }
 
-            if (!target_mac_matches(&event->disc.addr)) {
-                break;
-            }
 
             if (rc != 0) {
                 break;
@@ -359,6 +280,7 @@ int gap_event_handler(struct ble_gap_event *event, void *arg) {
                      packet.seq, packet.rssi, (int)packet.temp_x10,
                      (unsigned)packet.voltage_mv, (unsigned)flags,
                      flag_chg, flag_full, flag_plug);
+        
 
             mkey_notify_ble_packet(&packet);
 
@@ -405,7 +327,7 @@ static void start_scanning(void) {
 	disc_params.window = 0x30; // 30 ms window (100% duty cycle)
 	disc_params.filter_policy = BLE_HCI_SCAN_FILT_NO_WL;
 	disc_params.limited = 0;
-	disc_params.passive = 0;           // active scan to request scan response
+	disc_params.passive = 1;           // active scan to request scan response
 	disc_params.filter_duplicates = 1; // avoid duplicates
 
 	rc = ble_gap_disc(addr_type, BLE_HS_FOREVER, &disc_params, gap_event_handler, NULL);
@@ -437,9 +359,6 @@ void gap_scan_request(bool enable) {
 		return;
 	}
 	if (enable) {
-#if MKEY_BLE_FILTER_MAC
-		ensure_target_mac_parsed();
-#endif
 		start_scanning();
 	} else {
 		stop_scanning();

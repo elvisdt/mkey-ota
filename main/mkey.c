@@ -46,6 +46,10 @@ typedef enum {
 typedef struct {
     bool started;
     bool ign_on;
+    bool ble_failsafe_active;
+    bool ble_failsafe_output_on;
+    int64_t ble_failsafe_phase_us;
+    int64_t ign_on_since_us;
     mkey_charge_state_t charge_state;
     uint8_t last_battery;
     int64_t last_packet_us;
@@ -56,6 +60,10 @@ typedef struct {
 static mkey_ctx_t s_ctx = {
     .started = false,
     .ign_on = false,
+    .ble_failsafe_active = false,
+    .ble_failsafe_output_on = false,
+    .ble_failsafe_phase_us = 0,
+    .ign_on_since_us = 0,
     .charge_state = MKEY_CHG_IDLE,
     .last_battery = 0,
     .last_packet_us = 0,
@@ -69,6 +77,8 @@ static mkey_ctx_t s_ctx = {
 static void mkey_control_task(void *arg);
 static void mkey_update_charge_state(uint8_t battery_percent);
 static void mkey_set_charging(bool enable);
+static void mkey_ble_failsafe_reset(void);
+static void mkey_ble_failsafe_step(int64_t now_us, int64_t age_ms);
 static bool mkey_is_ign_on(void);
 static const char *mkey_reset_reason_str(esp_reset_reason_t reason);
 
@@ -83,8 +93,7 @@ void mkey_init(void) {
 
     mkey_init_pins();
 
-    ESP_LOGI(LOG_TAG_MKEY, "Reset reason: %s",
-             mkey_reset_reason_str(esp_reset_reason()));
+    ESP_LOGI(LOG_TAG_MKEY, "Reset reason: %s", mkey_reset_reason_str(esp_reset_reason()));
 
     s_ctx.queue = xQueueCreate(8, sizeof(mkey_evt_t));
     if (s_ctx.queue == NULL) {
@@ -129,6 +138,7 @@ static void mkey_control_task(void *arg) {
     }
 
     s_ctx.ign_on = mkey_is_ign_on();
+    s_ctx.ign_on_since_us = s_ctx.ign_on ? esp_timer_get_time() : 0;
     gap_scan_request(s_ctx.ign_on);
     if (!s_ctx.ign_on) {
         mkey_set_charging(false);
@@ -145,6 +155,7 @@ static void mkey_control_task(void *arg) {
                 }
                 s_ctx.last_battery = evt.packet.battery_percent;
                 s_ctx.last_packet_us = esp_timer_get_time();
+                mkey_ble_failsafe_reset();
                 mkey_update_charge_state(evt.packet.battery_percent);
             }
         }
@@ -152,27 +163,30 @@ static void mkey_control_task(void *arg) {
         const bool ign_now = mkey_is_ign_on();
         if (ign_now != s_ctx.ign_on) {
             s_ctx.ign_on = ign_now;
+            s_ctx.ign_on_since_us = s_ctx.ign_on ? esp_timer_get_time() : 0;
             gap_scan_request(s_ctx.ign_on);
 
             if (!s_ctx.ign_on) {
+                mkey_ble_failsafe_reset();
                 mkey_set_charging(false);
                 s_ctx.charge_state = MKEY_CHG_IDLE;
                 s_ctx.last_packet_us = 0;
             }
         }
 
-        if (s_ctx.ign_on && MKEY_BLE_STALE_TIMEOUT_MS > 0 &&
-            s_ctx.last_packet_us > 0) {
+        if (s_ctx.ign_on && MKEY_BLE_STALE_TIMEOUT_MS > 0) {
             const int64_t now_us = esp_timer_get_time();
-            const int64_t age_ms = (now_us - s_ctx.last_packet_us) / 1000;
+            const int64_t ref_us = (s_ctx.last_packet_us > 0)
+                ? s_ctx.last_packet_us
+                : s_ctx.ign_on_since_us;
+            const int64_t age_ms = (ref_us > 0) ? ((now_us - ref_us) / 1000) : 0;
             if (age_ms >= (int64_t)MKEY_BLE_STALE_TIMEOUT_MS) {
-                if (s_ctx.charge_state != MKEY_CHG_IDLE) {
-                    ESP_LOGW(LOG_TAG_MKEY, "BLE stale (%lld ms), stopping charge",
-                             (long long)age_ms);
-                    s_ctx.charge_state = MKEY_CHG_IDLE;
-                    mkey_set_charging(false);
-                }
+                mkey_ble_failsafe_step(now_us, age_ms);
+            } else {
+                mkey_ble_failsafe_reset();
             }
+        } else {
+            mkey_ble_failsafe_reset();
         }
 
         esp_task_wdt_reset();
@@ -188,8 +202,7 @@ static void mkey_update_charge_state(uint8_t battery_percent) {
     if (s_ctx.charge_state == MKEY_CHG_IDLE) {
         if (battery_percent <= MKEY_CHARGE_START_PCT) {
             s_ctx.charge_state = MKEY_CHG_CHARGING;
-            ESP_LOGI(LOG_TAG_MKEY, "Battery %u%% -> charging ON",
-                     battery_percent);
+            ESP_LOGI(LOG_TAG_MKEY, "Battery %u%% -> charging ON", battery_percent);
             mkey_set_charging(true);
         }
         return;
@@ -206,21 +219,97 @@ static void mkey_update_charge_state(uint8_t battery_percent) {
 }
 
 static void mkey_set_charging(bool enable) {
-    const int relay_level =
-        enable ? MKEY_RELAY_ACTIVE_LEVEL : !MKEY_RELAY_ACTIVE_LEVEL;
-    const int led_level =
-        enable ? MKEY_LED_ACTIVE_LEVEL : !MKEY_LED_ACTIVE_LEVEL;
 
+    ESP_LOGW(LOG_TAG_MKEY, "Setting charging %s (ign_on=%d)", enable ? "ON" : "OFF", s_ctx.ign_on);
+    const int relay_level = enable ? MKEY_RELAY_ACTIVE_LEVEL : !MKEY_RELAY_ACTIVE_LEVEL;
+    
     gpio_set_level(PIN_OUT_RELAY, relay_level);
-    gpio_set_level(PIN_OUT_LED, led_level);
+    
+}
+
+static void mkey_ble_failsafe_reset(void) {
+    if (!s_ctx.ble_failsafe_active) {
+        return;
+    }
+
+    s_ctx.ble_failsafe_active = false;
+    s_ctx.ble_failsafe_phase_us = 0;
+    s_ctx.ble_failsafe_output_on = false;
+
+    ESP_LOGI(LOG_TAG_MKEY, "BLE failsafe cleared, restoring normal charge control");
+    mkey_set_charging(s_ctx.charge_state == MKEY_CHG_CHARGING);
+}
+
+static void mkey_ble_failsafe_step(int64_t now_us, int64_t age_ms) {
+    bool desired_enable = false;
+    bool apply_output = false;
+    bool entered_failsafe = false;
+
+    if (!s_ctx.ble_failsafe_active) {
+        entered_failsafe = true;
+        s_ctx.ble_failsafe_active = true;
+        s_ctx.ble_failsafe_phase_us = now_us;
+        ESP_LOGW(LOG_TAG_MKEY, "BLE stale (%lld ms), entering failsafe mode=%d",
+                 (long long)age_ms, MKEY_BLE_FAILSAFE_MODE);
+    }
+
+#if MKEY_BLE_FAILSAFE_MODE == MKEY_BLE_FAILSAFE_ON
+    desired_enable = true;
+#elif MKEY_BLE_FAILSAFE_MODE == MKEY_BLE_FAILSAFE_CYCLE
+    if (MKEY_BLE_FAILSAFE_ON_MS <= 0 || MKEY_BLE_FAILSAFE_OFF_MS <= 0) {
+        desired_enable = true;
+    } else {
+        if (!s_ctx.ble_failsafe_output_on && s_ctx.ble_failsafe_phase_us == now_us) {
+            // Primer ingreso al ciclo: iniciar con 5 min ON.
+            s_ctx.ble_failsafe_output_on = true;
+            apply_output = true;
+            ESP_LOGW(LOG_TAG_MKEY, "BLE failsafe cycle -> charging ON");
+        }
+
+        if (s_ctx.ble_failsafe_phase_us == 0) {
+            s_ctx.ble_failsafe_phase_us = now_us;
+        }
+
+        const int64_t phase_elapsed_ms =
+            (now_us - s_ctx.ble_failsafe_phase_us) / 1000;
+        const int64_t phase_limit_ms = s_ctx.ble_failsafe_output_on
+            ? (int64_t)MKEY_BLE_FAILSAFE_ON_MS
+            : (int64_t)MKEY_BLE_FAILSAFE_OFF_MS;
+
+        if (phase_elapsed_ms >= phase_limit_ms) {
+            s_ctx.ble_failsafe_output_on = !s_ctx.ble_failsafe_output_on;
+            s_ctx.ble_failsafe_phase_us = now_us;
+            ESP_LOGW(LOG_TAG_MKEY, "BLE failsafe cycle -> charging %s",
+                     s_ctx.ble_failsafe_output_on ? "ON" : "OFF");
+            apply_output = true;
+        }
+
+        desired_enable = s_ctx.ble_failsafe_output_on;
+    }
+#else
+    desired_enable = false;
+#endif
+
+    if (desired_enable != s_ctx.ble_failsafe_output_on) {
+        s_ctx.ble_failsafe_output_on = desired_enable;
+        s_ctx.ble_failsafe_phase_us = now_us;
+        ESP_LOGW(LOG_TAG_MKEY, "BLE failsafe -> charging %s",
+                 desired_enable ? "ON" : "OFF");
+        apply_output = true;
+    }
+
+    if (apply_output || entered_failsafe) {
+        mkey_set_charging(desired_enable);
+    }
 }
 
 static bool mkey_is_ign_on(void) {
-#if MKEY_SIMULATE_IGN
-    return true;
-#else
-    return gpio_get_level(PIN_IN_IGN) == MKEY_IGN_ACTIVE_LEVEL;
-#endif
+    const int ign_level = gpio_get_level(PIN_IN_IGN);
+    const bool ign_on = (ign_level == MKEY_IGN_ACTIVE_LEVEL);
+    gpio_set_level(PIN_OUT_LED, ign_on ? MKEY_LED_ACTIVE_LEVEL : !MKEY_LED_ACTIVE_LEVEL);
+    
+    return ign_on;
+
 }
 
 static const char *mkey_reset_reason_str(esp_reset_reason_t reason) {
@@ -252,20 +341,19 @@ void mkey_init_pins(void) {
 
     ESP_LOGI(LOG_TAG_MKEY, "Initializing MKEY pins...");
 
-#if !MKEY_SIMULATE_IGN
+
     gpio_config_t io_conf_in = {
         .intr_type = GPIO_INTR_DISABLE,
         .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL << PIN_IN_IGN),
+        .pin_bit_mask = (1ULL << PIN_IN_IGN) | (1ULL << PIN_IN_DOOR),
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pull_up_en = GPIO_PULLUP_ENABLE,
     };
     ret = gpio_config(&io_conf_in);
     if (ret != ESP_OK) {
-        ESP_LOGE(LOG_TAG_MKEY, "Failed to configure input pin (%s)!",
-                 esp_err_to_name(ret));
+        ESP_LOGE(LOG_TAG_MKEY, "Failed to configure input pin (%s)!", esp_err_to_name(ret));
     }
-#endif
+
 
     gpio_config_t io_conf_out = {
         .intr_type = GPIO_INTR_DISABLE,
@@ -275,9 +363,9 @@ void mkey_init_pins(void) {
         .pull_up_en = GPIO_PULLUP_DISABLE,
     };
     ret = gpio_config(&io_conf_out);
+
     if (ret != ESP_OK) {
-        ESP_LOGE(LOG_TAG_MKEY, "Failed to configure output pins (%s)!",
-                 esp_err_to_name(ret));
+        ESP_LOGE(LOG_TAG_MKEY, "Failed to configure output pins (%s)!", esp_err_to_name(ret));
     }
 
     mkey_set_charging(false);
