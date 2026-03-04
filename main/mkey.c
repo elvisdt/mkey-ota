@@ -57,6 +57,8 @@ typedef struct {
     bool ign_on;
     bool ble_failsafe_active;
     bool ble_failsafe_output_on;
+    bool charge_flag_mismatch_active;
+    bool initial_charge_pending;
     int64_t ble_failsafe_phase_us;
     int64_t ign_on_since_us;
     mkey_charge_state_t charge_state;
@@ -73,6 +75,8 @@ static mkey_ctx_t s_ctx = {
     .ign_on = false,
     .ble_failsafe_active = false,
     .ble_failsafe_output_on = false,
+    .charge_flag_mismatch_active = false,
+    .initial_charge_pending = true,
     .ble_failsafe_phase_us = 0,
     .ign_on_since_us = 0,
     .charge_state = MKEY_CHG_IDLE,
@@ -93,6 +97,7 @@ static void mkey_update_charge_state(uint8_t battery_percent);
 static void mkey_set_charging(bool enable);
 static void mkey_set_led(bool on);
 static void mkey_log_gpio_state(const char *reason);
+static void mkey_validate_charge_flag(const mkey_ble_packet_t *packet);
 static void mkey_ble_failsafe_reset(void);
 static void mkey_ble_failsafe_step(int64_t now_us, int64_t age_ms);
 static void mkey_update_led_mode(int64_t now_us);
@@ -185,6 +190,7 @@ static void mkey_control_task(void *arg) {
                 s_ctx.last_packet_us = esp_timer_get_time();
                 mkey_ble_failsafe_reset();
                 mkey_update_charge_state(evt.packet.battery_percent);
+                mkey_validate_charge_flag(&evt.packet);
                 mkey_update_led_mode(s_ctx.last_packet_us);
             }
         }
@@ -200,6 +206,7 @@ static void mkey_control_task(void *arg) {
                 mkey_set_charging(false);
                 s_ctx.charge_state = MKEY_CHG_IDLE;
                 s_ctx.last_packet_us = 0;
+                s_ctx.charge_flag_mismatch_active = false;
             }
         }
 
@@ -226,6 +233,27 @@ static void mkey_control_task(void *arg) {
 
 static void mkey_update_charge_state(uint8_t battery_percent) {
     if (battery_percent > MKEY_BLE_MAX_BATT) {
+        return;
+    }
+
+    if (s_ctx.initial_charge_pending) {
+        if (battery_percent >= MKEY_CHARGE_STOP_PCT) {
+            s_ctx.initial_charge_pending = false;
+            s_ctx.charge_state = MKEY_CHG_IDLE;
+            ESP_LOGI(LOG_TAG_MKEY,
+                     "Initial charge done (battery=%u%%), switching to normal cycle",
+                     battery_percent);
+            mkey_set_charging(false);
+            return;
+        }
+
+        if (s_ctx.charge_state != MKEY_CHG_CHARGING) {
+            s_ctx.charge_state = MKEY_CHG_CHARGING;
+            ESP_LOGI(LOG_TAG_MKEY,
+                     "Initial charge active (battery=%u%%), forcing charge until %u%%",
+                     battery_percent, MKEY_CHARGE_STOP_PCT);
+            mkey_set_charging(true);
+        }
         return;
     }
 
@@ -288,6 +316,30 @@ static void mkey_ble_failsafe_reset(void) {
 
     ESP_LOGI(LOG_TAG_MKEY, "BLE failsafe cleared, restoring normal charge control");
     mkey_set_charging(s_ctx.charge_state == MKEY_CHG_CHARGING);
+}
+
+static void mkey_validate_charge_flag(const mkey_ble_packet_t *packet) {
+    if (packet == NULL) {
+        return;
+    }
+
+    const bool relay_active = (gpio_get_level(PIN_OUT_RELAY) == MKEY_RELAY_ACTIVE_LEVEL);
+    const bool ble_charging_flag = ((packet->flags & 0x01u) != 0u);
+    const bool mismatch = relay_active && !ble_charging_flag;
+
+    if (mismatch && !s_ctx.charge_flag_mismatch_active) {
+        s_ctx.charge_flag_mismatch_active = true;
+        ESP_LOGW(LOG_TAG_MKEY,
+                 "Mismatch CHG: REL active but BLE C=0 (seq=%u flags=0x%02X)",
+                 packet->seq, (unsigned)packet->flags);
+        mkey_log_gpio_state("mismatch");
+        return;
+    }
+
+    if (!mismatch && s_ctx.charge_flag_mismatch_active) {
+        s_ctx.charge_flag_mismatch_active = false;
+        ESP_LOGI(LOG_TAG_MKEY, "Mismatch CHG cleared (seq=%u)", packet->seq);
+    }
 }
 
 static void mkey_ble_failsafe_step(int64_t now_us, int64_t age_ms) {

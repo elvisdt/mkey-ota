@@ -87,7 +87,7 @@
 
 
 // Filtrar por tablet_id (0 = deshabilitado)
-#define MKEY_BLE_TARGET_TABLET_ID 2
+#define MKEY_BLE_TARGET_TABLET_ID 1
 
 
 // Logging (1 = log all advertisements, 0 = only log valid MKEY packets)
