@@ -6,14 +6,26 @@
 #include "driver/gpio.h"
 
 // ----------------------------------------------------
-// MKEY HARDWARE DEFINES (ajusta segun la tarjeta)
+// MKEY HARDWARE CHILE
 // ----------------------------------------------------
+// #define PIN_OUT_RELAY   6
+// #define PIN_OUT_LED     3
 
-#define PIN_OUT_RELAY   6
-#define PIN_OUT_LED     3
+// #define PIN_IN_IGN      4
+// #define PIN_IN_DOOR     5
 
-#define PIN_IN_IGN      4
+
+
+// ----------------------------------------------------
+// MKEY HARDWARE PERU
+// ----------------------------------------------------
+#define PIN_OUT_RELAY   2
+#define PIN_OUT_LED     7
+
+#define PIN_IN_IGN      1
 #define PIN_IN_DOOR     5
+
+
 
 // Niveles activos (1 = nivel alto, 0 = nivel bajo)
 // En el firmware anterior IGN parecia activo en bajo; ajusta si aplica.
@@ -23,6 +35,21 @@
 #define MKEY_RELAY_ACTIVE_LEVEL   0 // Rele activo en bajo (0V) para evitar consumo cuando no esta conectado a la bateria
 #define MKEY_LED_ACTIVE_LEVEL     1 // LED activo en alto (3.3V)
 
+// ----------------------------------------------------
+// LED DE ESTADO BLE
+// ----------------------------------------------------
+// Si no se reciben paquetes BLE nuevos por este tiempo, se considera "sin BLE".
+#define MKEY_LED_BLE_DETECTED_TIMEOUT_MS 30000
+
+// Patrón cuando hay BLE detectado.
+// ON_MS: tiempo encendido dentro del periodo.
+// PERIOD_MS: periodo total del ciclo.
+#define MKEY_LED_CONNECTED_ON_MS         500
+#define MKEY_LED_CONNECTED_PERIOD_MS     1000
+
+// Patrón cuando no hay BLE detectado.
+#define MKEY_LED_NO_BLE_ON_MS            100
+#define MKEY_LED_NO_BLE_PERIOD_MS        200
 
 
 // ----------------------------------------------------
@@ -47,7 +74,7 @@
 #define MKEY_BLE_FAILSAFE_CYCLE   2
 
 #define MKEY_BLE_FAILSAFE_MODE    MKEY_BLE_FAILSAFE_CYCLE
-#define MKEY_BLE_FAILSAFE_ON_MS   (5 * 60 * 1000)   // 5 min
+#define MKEY_BLE_FAILSAFE_ON_MS   (10 * 60 * 1000)  // 10 min
 #define MKEY_BLE_FAILSAFE_OFF_MS  (5 * 60 * 1000)   // 5 min
 
 // ---------------------------------------------------------
@@ -65,6 +92,10 @@
 
 // Logging (1 = log all advertisements, 0 = only log valid MKEY packets)
 #define MKEY_BLE_LOG_ALL_ADVS    0
+// Log compacto para paquete MKEY (1 = abreviado, 0 = detallado)
+#define MKEY_BLE_LOG_COMPACT      1
+// Evita repetir logs con el mismo seq consecutivo
+#define MKEY_BLE_LOG_ONLY_NEW_SEQ 1
 
 // Validaciones basicas (igual al script Python)
 #define MKEY_BLE_MIN_BATT         0

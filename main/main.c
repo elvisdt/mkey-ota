@@ -86,5 +86,15 @@ void app_main(void) {
   // set device name and start host task
   ble_svc_gap_device_name_set(device_name);
   nimble_port_freertos_init(host_task);
-  
+
+
+  // uint8_t out_state = 0;
+  // for (;;){
+  //   out_state = !out_state;
+  //   gpio_set_level(PIN_OUT_LED, out_state);
+  //   gpio_set_level(PIN_OUT_RELAY, out_state);
+  //   ESP_LOGI(LOG_TAG_MAIN, "LED state: %d", out_state);
+  //   vTaskDelay(pdMS_TO_TICKS(1000));
+
+  // }
 }

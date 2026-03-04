@@ -26,6 +26,9 @@ static bool adv_cache_get(const ble_addr_t *addr, uint8_t *mfg_len, int8_t *rssi
 static bool s_gap_ready = false;
 static bool s_scan_requested = false;
 static bool s_scanning = false;
+static bool s_last_pkt_valid = false;
+static uint16_t s_last_pkt_tablet_id = 0;
+static uint8_t s_last_pkt_seq = 0;
 
 
 
@@ -274,12 +277,34 @@ int gap_event_handler(struct ble_gap_event *event, void *arg) {
             const unsigned flag_chg = (flags & 0x01) ? 1u : 0u;
             const unsigned flag_full = (flags & 0x02) ? 1u : 0u;
             const unsigned flag_plug = (flags & 0x04) ? 1u : 0u;
-            ESP_LOGI(LOG_TAG_GAP,
-                     "MKEY: mac=%s id=%u batt=%u%% seq=%u rssi=%d temp_x10=%d volt=%u flags=0x%02X (C=%u F=%u P=%u)",
-                     addr_buf, packet.tablet_id, packet.battery_percent,
-                     packet.seq, packet.rssi, (int)packet.temp_x10,
-                     (unsigned)packet.voltage_mv, (unsigned)flags,
-                     flag_chg, flag_full, flag_plug);
+
+            bool should_log_packet = true;
+#if MKEY_BLE_LOG_ONLY_NEW_SEQ
+            if (s_last_pkt_valid &&
+                s_last_pkt_tablet_id == packet.tablet_id &&
+                s_last_pkt_seq == packet.seq) {
+                should_log_packet = false;
+            }
+#endif
+            if (should_log_packet) {
+                s_last_pkt_valid = true;
+                s_last_pkt_tablet_id = packet.tablet_id;
+                s_last_pkt_seq = packet.seq;
+#if MKEY_BLE_LOG_COMPACT
+                ESP_LOGI(LOG_TAG_GAP,
+                         "MK id=%u s=%u b=%u r=%d t=%d v=%u f=%02X C%uF%uP%u mac=%s",
+                         packet.tablet_id, packet.seq, packet.battery_percent,
+                         packet.rssi, (int)packet.temp_x10, (unsigned)packet.voltage_mv,
+                         (unsigned)flags, flag_chg, flag_full, flag_plug, addr_buf);
+#else
+                ESP_LOGI(LOG_TAG_GAP,
+                         "MKEY: mac=%s id=%u batt=%u%% seq=%u rssi=%d temp_x10=%d volt=%u flags=0x%02X (C=%u F=%u P=%u)",
+                         addr_buf, packet.tablet_id, packet.battery_percent,
+                         packet.seq, packet.rssi, (int)packet.temp_x10,
+                         (unsigned)packet.voltage_mv, (unsigned)flags,
+                         flag_chg, flag_full, flag_plug);
+#endif
+            }
         
 
             mkey_notify_ble_packet(&packet);

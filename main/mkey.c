@@ -25,6 +25,9 @@
 #define MKEY_CTRL_TASK_STACK   4096
 #define MKEY_CTRL_TASK_PRIO    5
 #define MKEY_CTRL_TICK_MS      100
+#define MKEY_LED_TASK_STACK    2048
+#define MKEY_LED_TASK_PRIO     4
+#define MKEY_LED_TASK_TICK_MS  50
 
 /****************************************************
  * TYPES
@@ -43,6 +46,12 @@ typedef enum {
     MKEY_CHG_CHARGING,
 } mkey_charge_state_t;
 
+typedef enum {
+    MKEY_LED_MODE_OFF = 0,
+    MKEY_LED_MODE_BLE_DETECTED,
+    MKEY_LED_MODE_BLE_NOT_DETECTED,
+} mkey_led_mode_t;
+
 typedef struct {
     bool started;
     bool ign_on;
@@ -51,10 +60,12 @@ typedef struct {
     int64_t ble_failsafe_phase_us;
     int64_t ign_on_since_us;
     mkey_charge_state_t charge_state;
+    mkey_led_mode_t led_mode;
     uint8_t last_battery;
     int64_t last_packet_us;
     QueueHandle_t queue;
     TaskHandle_t task;
+    TaskHandle_t led_task;
 } mkey_ctx_t;
 
 static mkey_ctx_t s_ctx = {
@@ -65,20 +76,26 @@ static mkey_ctx_t s_ctx = {
     .ble_failsafe_phase_us = 0,
     .ign_on_since_us = 0,
     .charge_state = MKEY_CHG_IDLE,
+    .led_mode = MKEY_LED_MODE_OFF,
     .last_battery = 0,
     .last_packet_us = 0,
     .queue = NULL,
     .task = NULL,
+    .led_task = NULL,
 };
 
 /****************************************************
  * FORWARD DECLARATIONS
 *****************************************************/
 static void mkey_control_task(void *arg);
+static void mkey_led_task(void *arg);
 static void mkey_update_charge_state(uint8_t battery_percent);
 static void mkey_set_charging(bool enable);
+static void mkey_set_led(bool on);
+static void mkey_log_gpio_state(const char *reason);
 static void mkey_ble_failsafe_reset(void);
 static void mkey_ble_failsafe_step(int64_t now_us, int64_t age_ms);
+static void mkey_update_led_mode(int64_t now_us);
 static bool mkey_is_ign_on(void);
 static const char *mkey_reset_reason_str(esp_reset_reason_t reason);
 
@@ -111,6 +128,14 @@ void mkey_init(void) {
         return;
     }
 
+    ok = xTaskCreate(mkey_led_task, "mkey_led",
+                     MKEY_LED_TASK_STACK, NULL,
+                     MKEY_LED_TASK_PRIO, &s_ctx.led_task);
+    if (ok != pdPASS) {
+        ESP_LOGE(LOG_TAG_MKEY, "Failed to start mkey LED task");
+        mkey_set_led(false);
+    }
+
     s_ctx.started = true;
 }
 
@@ -131,6 +156,8 @@ void mkey_notify_ble_packet(const mkey_ble_packet_t *packet) {
  * INTERNALS
 *****************************************************/
 static void mkey_control_task(void *arg) {
+    (void)arg;
+
     esp_err_t wdt_ret = esp_task_wdt_add(NULL);
     if (wdt_ret != ESP_OK && wdt_ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(LOG_TAG_MKEY, "Failed to register WDT for mkey task (%s)",
@@ -145,6 +172,7 @@ static void mkey_control_task(void *arg) {
         s_ctx.charge_state = MKEY_CHG_IDLE;
         s_ctx.last_packet_us = 0;
     }
+    mkey_update_led_mode(esp_timer_get_time());
 
     while (1) {
         mkey_evt_t evt;
@@ -157,6 +185,7 @@ static void mkey_control_task(void *arg) {
                 s_ctx.last_packet_us = esp_timer_get_time();
                 mkey_ble_failsafe_reset();
                 mkey_update_charge_state(evt.packet.battery_percent);
+                mkey_update_led_mode(s_ctx.last_packet_us);
             }
         }
 
@@ -174,8 +203,8 @@ static void mkey_control_task(void *arg) {
             }
         }
 
+        const int64_t now_us = esp_timer_get_time();
         if (s_ctx.ign_on && MKEY_BLE_STALE_TIMEOUT_MS > 0) {
-            const int64_t now_us = esp_timer_get_time();
             const int64_t ref_us = (s_ctx.last_packet_us > 0)
                 ? s_ctx.last_packet_us
                 : s_ctx.ign_on_since_us;
@@ -188,6 +217,7 @@ static void mkey_control_task(void *arg) {
         } else {
             mkey_ble_failsafe_reset();
         }
+        mkey_update_led_mode(now_us);
 
         esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(MKEY_CTRL_TICK_MS));
@@ -220,11 +250,31 @@ static void mkey_update_charge_state(uint8_t battery_percent) {
 
 static void mkey_set_charging(bool enable) {
 
-    ESP_LOGW(LOG_TAG_MKEY, "Setting charging %s (ign_on=%d)", enable ? "ON" : "OFF", s_ctx.ign_on);
     const int relay_level = enable ? MKEY_RELAY_ACTIVE_LEVEL : !MKEY_RELAY_ACTIVE_LEVEL;
-    
     gpio_set_level(PIN_OUT_RELAY, relay_level);
-    
+
+    ESP_LOGW(LOG_TAG_MKEY, "CHG %s (ign=%d)", enable ? "ON" : "OFF", s_ctx.ign_on);
+    mkey_log_gpio_state("chg");
+}
+
+static void mkey_set_led(bool on) {
+    const int led_level = on ? MKEY_LED_ACTIVE_LEVEL : !MKEY_LED_ACTIVE_LEVEL;
+    gpio_set_level(PIN_OUT_LED, led_level);
+}
+
+static void mkey_log_gpio_state(const char *reason) {
+    const int ign_level = gpio_get_level(PIN_IN_IGN);
+    const int relay_level = gpio_get_level(PIN_OUT_RELAY);
+    const int led_level = gpio_get_level(PIN_OUT_LED);
+
+    const int ign_active = (ign_level == MKEY_IGN_ACTIVE_LEVEL) ? 1 : 0;
+    const int relay_active = (relay_level == MKEY_RELAY_ACTIVE_LEVEL) ? 1 : 0;
+    const int led_active = (led_level == MKEY_LED_ACTIVE_LEVEL) ? 1 : 0;
+
+    ESP_LOGI(LOG_TAG_MKEY,
+             "GPIO[%s] IGN:%d(A:%d) REL:%d(A:%d) LED:%d(A:%d)",
+             reason ? reason : "-", ign_level, ign_active,
+             relay_level, relay_active, led_level, led_active);
 }
 
 static void mkey_ble_failsafe_reset(void) {
@@ -306,10 +356,94 @@ static void mkey_ble_failsafe_step(int64_t now_us, int64_t age_ms) {
 static bool mkey_is_ign_on(void) {
     const int ign_level = gpio_get_level(PIN_IN_IGN);
     const bool ign_on = (ign_level == MKEY_IGN_ACTIVE_LEVEL);
-    gpio_set_level(PIN_OUT_LED, ign_on ? MKEY_LED_ACTIVE_LEVEL : !MKEY_LED_ACTIVE_LEVEL);
     
     return ign_on;
+}
 
+static void mkey_update_led_mode(int64_t now_us) {
+    mkey_led_mode_t new_mode = MKEY_LED_MODE_OFF;
+
+    if (s_ctx.ign_on) {
+        if (s_ctx.last_packet_us > 0) {
+            const int64_t age_ms = (now_us - s_ctx.last_packet_us) / 1000;
+            if (age_ms <= (int64_t)MKEY_LED_BLE_DETECTED_TIMEOUT_MS) {
+                new_mode = MKEY_LED_MODE_BLE_DETECTED;
+            } else {
+                new_mode = MKEY_LED_MODE_BLE_NOT_DETECTED;
+            }
+        } else {
+            new_mode = MKEY_LED_MODE_BLE_NOT_DETECTED;
+        }
+    }
+
+    if (new_mode != s_ctx.led_mode) {
+        s_ctx.led_mode = new_mode;
+        ESP_LOGI(LOG_TAG_MKEY, "LED mode -> %d", (int)new_mode);
+        mkey_log_gpio_state("led_mode");
+    }
+}
+
+static void mkey_led_task(void *arg) {
+    (void)arg;
+
+    mkey_led_mode_t prev_mode = (mkey_led_mode_t)(-1);
+    bool led_on = false;
+    TickType_t phase_start = 0;
+
+    while (1) {
+        const mkey_led_mode_t mode = s_ctx.led_mode;
+        if (mode != prev_mode) {
+            prev_mode = mode;
+            phase_start = xTaskGetTickCount();
+            led_on = false;
+
+            if (mode == MKEY_LED_MODE_OFF) {
+                mkey_set_led(false);
+            } else {
+                led_on = true;
+                mkey_set_led(true);
+            }
+        }
+
+        if (mode != MKEY_LED_MODE_OFF) {
+            const uint32_t on_ms = (mode == MKEY_LED_MODE_BLE_DETECTED)
+                ? (uint32_t)MKEY_LED_CONNECTED_ON_MS
+                : (uint32_t)MKEY_LED_NO_BLE_ON_MS;
+            const uint32_t period_ms = (mode == MKEY_LED_MODE_BLE_DETECTED)
+                ? (uint32_t)MKEY_LED_CONNECTED_PERIOD_MS
+                : (uint32_t)MKEY_LED_NO_BLE_PERIOD_MS;
+
+            if (period_ms == 0) {
+                if (led_on) {
+                    led_on = false;
+                    mkey_set_led(false);
+                }
+            } else if (on_ms >= period_ms) {
+                if (!led_on) {
+                    led_on = true;
+                    mkey_set_led(true);
+                }
+            } else if (on_ms == 0) {
+                if (led_on) {
+                    led_on = false;
+                    mkey_set_led(false);
+                }
+            } else {
+                const TickType_t now = xTaskGetTickCount();
+                const uint32_t elapsed_ms =
+                    (uint32_t)((now - phase_start) * portTICK_PERIOD_MS);
+                const uint32_t phase_ms = elapsed_ms % period_ms;
+                const bool desired_on = (phase_ms < on_ms);
+
+                if (desired_on != led_on) {
+                    led_on = desired_on;
+                    mkey_set_led(led_on);
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(MKEY_LED_TASK_TICK_MS));
+    }
 }
 
 static const char *mkey_reset_reason_str(esp_reset_reason_t reason) {
@@ -369,6 +503,7 @@ void mkey_init_pins(void) {
     }
 
     mkey_set_charging(false);
+    mkey_set_led(false);
 
     ESP_LOGI(LOG_TAG_MKEY, "MKEY pins initialized.");
 }
