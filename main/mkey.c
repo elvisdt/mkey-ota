@@ -531,7 +531,7 @@ void mkey_init_pins(void) {
     gpio_config_t io_conf_in = {
         .intr_type = GPIO_INTR_DISABLE,
         .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL << PIN_IN_IGN) | (1ULL << PIN_IN_DOOR),
+        .pin_bit_mask = (1ULL << PIN_IN_IGN) | (1ULL << PIN_IN_N01),
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pull_up_en = GPIO_PULLUP_ENABLE,
     };

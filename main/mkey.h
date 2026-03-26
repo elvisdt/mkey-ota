@@ -12,19 +12,22 @@
 // #define PIN_OUT_LED     3
 
 // #define PIN_IN_IGN      4
-// #define PIN_IN_DOOR     5
+// #define PIN_IN_N01     5
 
 
 
 // ----------------------------------------------------
 // MKEY HARDWARE PERU
 // ----------------------------------------------------
+#define PIN_OUT_BUZZER   0
 #define PIN_OUT_RELAY   2
 #define PIN_OUT_LED     7
+#define PIN_OUT_N01     3
+#define PIN_OUT_N02     4
 
 #define PIN_IN_IGN      1
-#define PIN_IN_DOOR     5
-
+#define PIN_IN_N01      5
+#define PIN_IN_N02      6
 
 
 // Niveles activos (1 = nivel alto, 0 = nivel bajo)
