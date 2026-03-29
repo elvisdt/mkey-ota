@@ -44,7 +44,7 @@ static uint8_t lvl_status = 0;
 static uint8_t block_status = 0;
 
 
-static void start_block_progress(void);
+static void block_progress_start(void);
 
 esp_err_t nvs_init_config(void){
 
@@ -128,7 +128,7 @@ void on_sensor_callback(button_t *btn, button_state_t state) {
 		}
 
 		if(state == BUTTON_PRESSED){
-			 start_block_progress();
+			 block_progress_start();
 		}else if(state == BUTTON_RELEASED){
             xTimerStop(blink_timer, 0);
             blink_running = false;
@@ -220,7 +220,7 @@ static void blink_timer_cb(TimerHandle_t xTimer) {
     }
 }
 
-static void start_block_progress(void) {
+static void block_progress_start(void) {
     if (blink_running) { return;}
 
     blink_running = true;
@@ -230,7 +230,36 @@ static void start_block_progress(void) {
     xTimerStart(blink_timer, 0);
 }
 
+static void block_device_stop(void) {
+    if (blink_running) {
+        xTimerStop(blink_timer, 0);
+    }
 
+    blink_running = false;
+    blink_toggles = 0;
+
+    gpio_set_level(PIN_OUT_LED, 1);
+    gpio_set_level(PIN_OUT_RELAY, 1);
+
+    // Update block status in NVS
+    nvs_set_u8(my_handle_nvs, NVS_KEY_BLOCK_STATUS, 1);
+    nvs_commit(my_handle_nvs);
+}
+
+
+static void unlock_device_stop(void) {
+    if (blink_running) {
+        xTimerStop(blink_timer, 0);
+    }
+    blink_running = false;
+    blink_toggles = 0;
+
+    gpio_set_level(PIN_OUT_LED, 0);
+    gpio_set_level(PIN_OUT_RELAY, 0);
+
+    nvs_set_u8(my_handle_nvs, NVS_KEY_BLOCK_STATUS, 0);
+    nvs_commit(my_handle_nvs);
+}
 
 
 
@@ -293,8 +322,10 @@ void app_main(void) {
 
     /*  Validate */
     if(block_status == 1){
-        ESP_LOGW(LOG_TAG_MAIN, "Device is in BLOCKED state. Starting block progress...");
-        start_block_progress();
+        int ign_lvl = gpio_get_level(PIN_IN_IGN);
+        ESP_LOGW(LOG_TAG_MAIN, "Device is in BLOCKED state. IGN level: %d : %s", ign_lvl, ign_lvl ? "HIGH" : "LOW");
+        gpio_get_level(PIN_IN_IGN) ? block_progress_start() : block_device_stop();
+
     }else{
         ESP_LOGI(LOG_TAG_MAIN, "Device is in UNBLOCKED state. Waiting for button press...");
         gpio_set_level(PIN_OUT_LED, 0);
